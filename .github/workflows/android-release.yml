@@ -1,0 +1,112 @@
+name: Build Debug APK & Publish GitHub Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Compile Debug APK & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Prepare .env and debug.keystore
+        run: |
+          if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+            cp .env.example .env
+          fi
+          if [ ! -f "debug.keystore" ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build Debug APK
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          else
+            gradle :app:assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Prepare OpenVault Debug APK artifact
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "Error: Debug APK not found in app/build/outputs/apk/debug"
+            exit 1
+          fi
+          cp "$APK_PATH" OpenVault-debug.apk
+          ls -lh OpenVault-debug.apk
+
+      - name: Upload Debug APK to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVault-debug-apk
+          path: OpenVault-debug.apk
+          if-no-files-found: error
+
+      - name: Determine Release Tag and Name
+        id: release_meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            RELEASE_NAME="OpenVault ${TAG_NAME}"
+          else
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            TAG_NAME="v1.0.${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+            RELEASE_NAME="OpenVault Build #${GITHUB_RUN_NUMBER} (${SHORT_SHA})"
+          fi
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release with Debug APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: ${{ steps.release_meta.outputs.release_name }}
+          body: |
+            ## OpenVault – E2E Zero-Knowledge Encrypted Android Vault
+            Automaticky sestavené **Debug APK** připravené k přímé instalaci na Android zařízení.
+
+            - **Commit:** `${{ github.sha }}`
+            - **Soubor:** `OpenVault-debug.apk`
+          files: |
+            OpenVault-debug.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

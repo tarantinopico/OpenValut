@@ -1,0 +1,443 @@
+# OpenVault – Android aplikace (kompletní zadání)
+
+Jsi senior Android & Security Engineer. Tvým úkolem je navrhnout a kompletně naimplementovat plnohodnotnou, produkčně připravenou, end-to-end (E2E) šifrovanou nativní Android aplikaci **OpenVault**. Pracuj v **Plan Mode**: nejprve sestav detailní architektonický a implementační plán (seznam všech souborů, modulů a pořadí implementace) a následně vygeneruj kompletní, plně funkční a sestavitelný zdrojový kód projektu bez jakýchkoli kompromisů, zástupných bloků nebo nedodělků.
+
+---
+
+## 1. ÚVOD A CÍL
+
+- **Co se staví:** **OpenVault** – osobní, 100% end-to-end šifrovaný digitální trezor pro Android (poznámky, hesla s TOTP, šifrované soubory ve virtuálním souborovém systému, vlastní šifrovaný kalendář s volitelnou synchronizací se systémovým kalendářem, uživatelské databáze s vlastním schématem polí, kolekce/složky a šifrovaný append-only audit log).
+- **Platforma a technologie:** Výhradně **nativní Android** v jazyce **Kotlin**, **Jetpack Compose**, **Material 3**, s výchozím **AMOLED dark mode** (`#000000` pozadí).
+- **Přísný zákaz:** Žádný Flutter, žádný React Native, žádný WebView/HTML wrapper, žádné hybridní frameworky.
+- **Architektonická filozofie:**
+  - **Jeden uživatel (Single-tenant per vault):** Žádné uživatelské účty v Supabase Auth, žádná registrace e-mailem ani telefonem. Každá instalace/trezor je identifikován kryptograficky náhodným `UUID v4` (`vault_id`), které se posílá v HTTP hlavičce `x-vault-id`.
+  - **Online-first + Offline-capable:** Primárním cloudovým úložištěm je **Supabase** (PostgreSQL + Storage + Realtime). Lokální databáze **Room + SQLCipher** slouží jako šifrovaná lokální cache a offline buffer se synchronizační frontou (`SyncQueue`).
+  - **Zero-knowledge & 100% E2E šifrování na klientovi:** Supabase ukládá pouze šifrované binární bloby (`BYTEA`), inicializační vektory (`nonce`) a minimální provozní metadata (`id`, `vault_id`, `object_type`, `parent_id`, `rev`, `created_at`, `updated_at`, `deleted_at`). Žádné plaintext názvy, žádné plaintext štítky, žádné plaintext obsahy ani klíče nesmí nikdy opustit zařízení v nezašifrované podobě.
+
+---
+
+## 2. TECHNICKÝ STACK (pevně daný)
+
+Projekt musí využívat následující knihovny a verze (nakonfigurované v `libs.versions.toml` a `build.gradle.kts`):
+
+- **Jazyk a kompilátor:** Kotlin 2.0+ (`org.jetbrains.kotlin.android`, `org.jetbrains.kotlin.plugin.compose`, `org.jetbrains.kotlin.plugin.serialization`, KSP).
+- **UI Framework:** Jetpack Compose (Material 3, `androidx.compose.material3`), `androidx.compose.material:material-icons-extended`, adaptivní layouty. Navigace řešená přes **Compose Navigation** (typově bezpečné routy) nebo vlastní deterministický stavový router – **striktně bez spodní navigační lišty (žádný Bottom Navigation Bar)**, primární navigací je **ModalNavigationDrawer** + **TopAppBar**.
+- **Dependency Injection:** **Hilt** (`com.google.dagger:hilt-android`, `androidx.hilt:hilt-navigation-compose`, `androidx.hilt:hilt-work`).
+- **Asynchronní zpracování:** **Kotlin Coroutines** (`kotlinx-coroutines-android`) + **Flow** (`StateFlow`, `SharedFlow`).
+- **Lokální šifrovaná databáze:** **Room** (`androidx.room:room-runtime`, `androidx.room:room-ktx`) + **SQLCipher** (`net.zetetic:sqlcipher-android:4.6.1` + `androidx.sqlite:sqlite-ktx`) pro šifrování celé lokální SQLite databáze.
+- **Kryptografie a správa klíčů:**
+  - **Android Keystore** (s preferencí **StrongBox** `setIsStrongBoxBacked(true)` s fallbackem na TEE) + **BiometricPrompt** (`androidx.biometric:biometric:1.2.0-alpha05`) využívající `BiometricPrompt.CryptoObject` (hardwarově vázané dešifrování).
+  - **AES-256-GCM** (přes `javax.crypto.Cipher` s `GCMParameterSpec(128, nonce)` nebo Google Tink `com.google.crypto.tink:tink-android`).
+  - **Odvození klíče (KDF):** **Argon2id** (přes `com.lambdapioneer.argon2kt:argon2kt` – parametry: paměť 64 MB, 3 iterace, paralelismus 4, výstup 32 bajtů) s deterministickým fallbackem na **PBKDF2-HMAC-SHA256** (minimálně `210_000` iterací, 256-bit výstup) tam, kde nativní knihovna není dostupná.
+  - **Lokální úložiště kryptografických obálek:** `androidx.security:security-crypto` (`EncryptedSharedPreferences`) pro uložení soli KDF (`kdf_salt`), zabaleného `Vault Key` (`wrapped_vk_master`, `wrapped_vk_biometric`) a `vault_id`.
+- **Cloud Backend SDK:** **supabase-kt** (`io.github.jan-tennert.supabase:postgrest-kt`, `storage-kt`, `realtime-kt`, verze 3.0+) + **Ktor Client** (`io.ktor:ktor-client-okhttp`, `ktor-client-websockets`, `ktor-client-content-negotiation`, `ktor-serialization-kotlinx-json`).
+- **Běh na pozadí:** **WorkManager** (`androidx.work:work-runtime-ktx`) pro periodickou a síťově podmíněnou synchronizaci, auto-lock timery a plánování připomínek kalendáře.
+- **Uživatelské preference (necitlivé):** **Jetpack DataStore Preferences** (`androidx.datastore:datastore-preferences`) – výhradně pro necitlivé UI volby (téma, velikost písma, hustota zobrazení, timeout auto-locku).
+- **Obrázky a náhledy:** **Coil** (`io.coil-kt:coil-compose`) s vlastním `Fetcher`/`Interceptor`, který dešifruje náhledy souborů v paměti přes `SecurityGate` (žádné nezašifrované diskové cache).
+- **Serializace:** `org.jetbrains.kotlinx:kotlinx-serialization-json`.
+
+---
+
+## 3. SUPABASE KONFIGURACE
+
+Backend v Supabase je již plně vytvořen, nakonfigurován a otestován. V aplikaci použij tyto **reálné produkční údaje** (nikoli placeholdery):
+
+- **`SUPABASE_URL`:** `https://qoawtepyyldnszfrajrx.supabase.co`
+- **`SUPABASE_ANON_KEY`:** `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFvYXd0ZXB5eWxkbnN6ZnJhanJ4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI5MjMzMTEsImV4cCI6MjEwODQ5OTMxMX0.t17ffYAfuA1-CeLu3vsLv42X8mNKWxUwYb0Ei_Dlofc`
+
+### Pravidla komunikace se Supabase
+1. **Povinná hlavička `x-vault-id`:** Každý HTTP požadavek ze `supabase-kt` / Ktor klienta (PostgREST i Storage) **MUSÍ** obsahovat hlavičku:
+   ```
+   x-vault-id: <UUID_VAULTU>
+   ```
+   Nakonfiguruj v `createSupabaseClient` vlastní Ktor default request interceptor (`defaultRequest { header("x-vault-id", vaultIdProvider.getVaultId()) }`), který tuto hlavičku automaticky připojí ke každému volání.
+2. **Izolace dat pomocí RLS (Row Level Security):** Aplikace používá veřejný `anon` klíč. Na straně databáze běží funkce `public.current_vault_id()`, která čte `x-vault-id` z HTTP hlaviček requestu, a striktní RLS politiky na všech tabulkách i v privátním Storage bucketu dovolí číst a zapisovat výhradně řádky a soubory patřící danému `vault_id`. Veškerý uživatelský obsah je navíc před odesláním na klientovi zašifrován pomocí AES-256-GCM.
+3. **Kódování `BYTEA` v PostgREST:** Sloupce typu `BYTEA` (`encrypted_payload`, `nonce`, `encrypted_settings`, `settings_nonce`, `integrity_hash`, `encrypted_metadata`, `metadata_nonce`, `encrypted_entry`, `entry_nonce`) se přes PostgREST JSON posílají a přijímají v PostgreSQL hex formátu `\x<hex_string>` (např. `\xdeadbeef`). Vytvoř spolehlivý `ByteaHexSerializer` (`KSerializer<ByteArray>`), který automaticky převádí `ByteArray` na `\x...` při serializaci a parsuje `\x...` (i případný base64 fallback) zpět na `ByteArray` při deserializaci.
+4. **Storage Bucket:** Privátní bucket s názvem `vault-files`. Všechny soubory musí být ukládány na cestu `{vault_id}/{file_id}.enc` (RLS politika vyžaduje, aby první složka cesty odpovídala `x-vault-id`). Samotný obsah souboru se nahrává již zašifrovaný.
+5. **Realtime publikace:** Tabulky `vault_objects` a `vault_files` jsou zařazeny do publikace `supabase_realtime`.
+
+### Kompletní SQL struktura databáze (již nasazená na serveru)
+
+```sql
+-- Rozšíření
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Tabulka vaultů (jeden řádek pro celý osobní vault uživatele)
+CREATE TABLE IF NOT EXISTS vaults (
+  id UUID PRIMARY KEY,
+  schema_version INT NOT NULL DEFAULT 1,
+  encrypted_settings BYTEA,
+  settings_nonce BYTEA,
+  integrity_hash BYTEA,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Hlavní tabulka objektů (poznámky, hesla, události, databáze, záznamy, kolekce, konfigurace, připomínky)
+CREATE TABLE IF NOT EXISTS vault_objects (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  object_type TEXT NOT NULL CHECK (object_type IN ('note','password','event','database','record','collection','config','reminder')),
+  parent_id UUID REFERENCES vault_objects(id) ON DELETE CASCADE,
+  encrypted_payload BYTEA NOT NULL,
+  nonce BYTEA NOT NULL,
+  rev BIGINT NOT NULL DEFAULT 1,
+  deleted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_objects_vault_id ON vault_objects(vault_id);
+CREATE INDEX IF NOT EXISTS idx_vault_objects_updated_at ON vault_objects(vault_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vault_objects_type ON vault_objects(vault_id, object_type) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_vault_objects_parent ON vault_objects(parent_id) WHERE deleted_at IS NULL;
+
+-- Metadata o souborech (samotné bloby jdou do Storage)
+CREATE TABLE IF NOT EXISTS vault_files (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  storage_path TEXT NOT NULL,
+  encrypted_metadata BYTEA NOT NULL,
+  metadata_nonce BYTEA NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  rev BIGINT NOT NULL DEFAULT 1,
+  deleted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_files_vault_id ON vault_files(vault_id);
+
+-- Šifrovaný append-only audit log
+CREATE TABLE IF NOT EXISTS vault_audit (
+  id BIGSERIAL PRIMARY KEY,
+  vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  encrypted_entry BYTEA NOT NULL,
+  entry_nonce BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_audit_vault_id ON vault_audit(vault_id, created_at DESC);
+
+-- Sync log pro delta sync
+CREATE TABLE IF NOT EXISTS vault_sync_log (
+  id BIGSERIAL PRIMARY KEY,
+  vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+  object_id UUID NOT NULL,
+  table_name TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('upsert','delete')),
+  rev BIGINT NOT NULL,
+  synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_sync_log_vault_id ON vault_sync_log(vault_id, synced_at DESC);
+
+-- Pomocná funkce pro získání vault_id z hlavičky requestu
+CREATE OR REPLACE FUNCTION public.current_vault_id() RETURNS UUID
+LANGUAGE SQL STABLE AS $$
+  SELECT NULLIF(current_setting('request.headers', true)::json->>'x-vault-id', '')::UUID;
+$$;
+
+-- RLS je zapnuté na všech tabulkách + politiky pro roli anon:
+-- vaults_own, objects_own, files_own, audit_own, sync_log_own
+-- Storage bucket 'vault-files' (private) s politikou 'vault_files_own' na storage.objects
+-- Triggery touch_updated_at() na vaults, vault_objects, vault_files
+-- Realtime publikace supabase_realtime na vault_objects a vault_files
+```
+
+---
+
+## 4. BEZPEČNOSTNÍ MODEL
+
+Bezpečnostní architektura nesmí být nikde obejita. Implementuj následující vrstvenou klíčovou hierarchii a pravidla:
+
+1. **Vrstvená klíčová hierarchie (Key Hierarchy):**
+   - **Master Password (MP):** Zvolené uživatelem při onboardingu. **NIKDY se nikam neukládá** (ani v paměti po odvození MK, ani na disk, ani do Keystore, ani do Supabase).
+   - **Master Key (MK – 256-bit):** Odvozen z Master Password a kryptograficky náhodné 16bajtové soli (`kdf_salt`) pomocí **Argon2id** (nebo PBKDF2-HMAC-SHA256 s 210 000 iteracemi). Slouží výhradně k zabalení (Key Wrapping přes AES-256-GCM) hlavního klíče trezoru (`Vault Key`).
+   - **Vault Key (VK – 256-bit):** Náhodně vygenerovaný 256bitový klíč (`SecureRandom`) při inicializaci trezoru. Tímto klíčem (nebo z něj odvozenými HKDF podklíči) se šifrují záznamy, soubory, audit log, nastavení trezoru a odvozuje se klíč pro SQLCipher databázi.
+   - **Item Keys / Per-Object Encryption:** Každý objekt v `vault_objects`, každý soubor ve `vault_files` a každý záznam ve `vault_audit` je šifrován samostatně pomocí **AES-256-GCM** s **unikátním 12bajtovým (96-bit) náhodným `nonce`** (`SecureRandom`) a autentizačním tagem (128-bit GCM tag). Jako Associated Authenticated Data (AAD) může být použit kontext nebo ponechán prázdný (musí být konzistentní mezi šifrováním a dešifrováním).
+   - **Uložení zabaleného VK:**
+     - `wrapped_vk_master`: `VK` zašifrovaný pomocí `MK` (AES-256-GCM) – umožňuje odemknutí zadáním Master Password.
+     - `wrapped_vk_biometric`: `VK` zašifrovaný hardwarovým klíčem z **Android Keystore** (`KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT`, `BLOCK_MODE_GCM`, `ENCRYPTION_PADDING_NONE`, `setUserAuthenticationRequired(true)`).
+2. **Biometrické odemykání a chování po restartu:**
+   - Při zapnutí biometrie se vygeneruje klíč v Android Keystore (s pokusem o `setIsStrongBoxBacked(true)`, pokud zařízení StrongBox podporuje, jinak standardní TEE Keystore).
+   - Odemykání biometrií používá `BiometricPrompt.CryptoObject(cipher)` pro dešifrování `wrapped_vk_biometric`.
+   - **Po restartu zařízení** (nebo při zneplatnění biometrie `KeyPermanentlyInvalidatedException` či flagu `isBootUnlocked == false` sledovaném v RAM / boot counteru `Settings.Global.BOOT_COUNT`) aplikace **vynutí zadání Master Password** před opětovným povolením biometrie.
+3. **Životní cyklus klíčů v paměti a Zeroization:**
+   - Odšifrovaný `Vault Key` drží v paměti výhradně centrální singleton **`SecurityGate`**.
+   - Při zamknutí trezoru (`lockVault()`) se pole `ByteArray` s klíčem okamžitě přepíše nulami (`Arrays.fill(keyBytes, 0.toByte())`) a reference se nastaví na `null`.
+4. **Centrální `SecurityGate`:**
+   - Všechny kryptografické operace (`encryptPayload`, `decryptPayload`, `encryptFileStream`, `decryptFileStream`, `computeIntegrityHash`, `changeMasterPassword`, `unlockWithPassword`, `unlockWithBiometrics`, `lock`) **MUSÍ** procházet přes třídu `SecurityGate`.
+   - Pokud je `SecurityGate` ve stavu `Locked`, jakýkoli pokus o čtení nebo zápis citlivých dat vyhodí `VaultLockedException` a UI okamžitě přesměruje uživatele na obrazovku odemknutí.
+5. **Ochrana běhového prostředí:**
+   - **Auto-lock:** Konfigurovatelný časovač nečinnosti (1–30 minut, výchozí 5 minut) + okamžité nebo zpožděné zamknutí při přechodu aplikace do pozadí (`ProcessLifecycleOwner` / `ON_STOP`) a při zhasnutí/zamknutí obrazovky (`Intent.ACTION_SCREEN_OFF`).
+   - **Ochrana schránky (Clipboard Security):** Při zkopírování hesla nebo TOTP kódu označ položku v Android 13+ jako citlivou (`ClipDescription.EXTRA_IS_SENSITIVE = true`) a naplánuj korutinu / handler, který po **30 sekundách** schránku automaticky vymaže (`ClipboardManager.clearPrimaryClip()` nebo přepsání prázdným klipem).
+   - **Ochrana obrazovky (`FLAG_SECURE`):** V `MainActivity` nastav `window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)`, aby se obsah trezoru nezobrazoval v Android App Switcheru a nešlo pořizovat screenshoty (s možností přepnutí v pokročilém nastavení bezpečnosti).
+   - **Detekce Rootu / Hook frameworků:** Implementuj `DeviceIntegrityChecker`, který kontroluje přítomnost binárek `su`, Magisk, test-keys v `Build.TAGS`, Xposed/Frida v načtených knihovnách (`/proc/self/maps`) a zobrazuje stav v Bezpečnostním centru (a varovný banner při zjištění rizika).
+   - **Volitelné Duress / Dvě hesla (Panic Password):** V pokročilém nastavení bezpečnosti umožni nastavit druhé (nouzové/duress) heslo, které při zadání na obrazovce odemknutí buď otevře prázdný krycí pohled, nebo bezpečně vymaže lokální klíče a dešifrovací obálky podle volby uživatele.
+
+---
+
+## 5. FUNKČNÍ SPECIFIKACE – KOMPLETNÍ SEZNAM
+
+Všechny níže uvedené moduly musí být plně funkční (žádné makety):
+
+1. **Poznámky (Notes):**
+   - Kompletní CRUD (vytvoření, čtení, úprava, soft-delete, obnova, trvalé smazání).
+   - Podpora **Markdownu** (nadpisy, tučné, kurzíva, seznamy, checklisty `- [ ]` / `- [x]`, bloky kódu, citace, odkazy) s živým přepínáním Edit / Preview režimu a dedikovanou Markdown lištou nad klávesnicí.
+   - Štítky (tags), připnutí poznámky (pinned), označení jako oblíbené (favorite), barva/kategorie, zařazení do kolekce/složky.
+   - Přílohy (napojení na šifrované soubory z VFS) a propojení s kalendářními událostmi (`event_links`).
+   - **Historie změn (Revision History):** Uchování předchozích revizí v šifrovaném payloadu poznámky s možností porovnání a obnovy starší verze.
+   - **Šablony poznámek:** Předdefinované i uživatelské šablony (např. Schůzka, Deník, Projekt, Bezpečnostní záznam, Prázdná poznámka).
+2. **Hesla (Passwords & TOTP):**
+   - Specializovaný záznam obsahující: titulek, uživatelské jméno / e-mail, heslo, URL / doménu, **TOTP tajemství (Base32)**, poznámku, kategorii (Bankovnictví, Sociální sítě, Práce, E-shopy, Krypto, Ostatní), příznak oblíbené, datum poslední změny a volitelné datum expirace.
+   - **Plně funkční TOTP generátor (RFC 6238):** Výpočet 6místného (nebo 8místného) kódu pomocí HMAC-SHA1/SHA256/SHA512 v reálném čase s odpočtem zbývajících sekund (30s okno) a kruhovým progress indikátorem.
+   - **Analýza síly hesla a audit:** Výpočet entropie v bitech (0–100 skóre: Slabé, Střední, Silné, Kryptograficky silné), kontrola unikátnosti (detekce duplicitních hesel napříč trezorem) a upozornění na expirovaná nebo stará hesla (> 180 dní).
+   - **Generátor hesel:** Nastavitelná délka (8–64 znaků), velká/malá písmena, číslice, speciální znaky, vyloučení podobných znaků (`O0Il1`) + režim generování **Passphrase** (víceslovné heslo oddělené pomlčkami).
+3. **Soubory – Virtuální souborový systém (VFS):**
+   - Hierarchické složky (kolekce typu složka / `parent_id`), nahrávání souborů z Android Storage Access Framework (`ActivityResultContracts.OpenDocument`), přesun mezi složkami, přejmenování, mazání, třídění (podle názvu, velikosti, data, typu) a vyhledávání.
+   - Vícenásobné připojení souboru k poznámkám, událostem nebo databázovým záznamům.
+   - **Šifrované náhledy:** Automatické generování zmenšeného šifrovaného náhledu (thumbnailu) u obrázků a textových/PDF souborů. Při nahrání souboru se binární obsah zašifruje pomocí `SecurityGate`, uloží do lokálního šifrovaného úložiště (`context.filesDir/vault_blobs/{id}.enc`) a odešle do Supabase Storage bucketu `vault-files` na cestu `{vault_id}/{file_id}.enc`.
+4. **Uživatelské databáze (Custom Structured Databases):**
+   - Uživatel si může vytvořit libovolný počet vlastních strukturovaných databází (např. „Licenční klíče", „Bankovní karty", „Zdravotní záznamy", „Krypto seedy", „Smlouvy") s popisem a ikonou.
+   - **Schema Builder:** Definice polí s podporou typů: `TEXT`, `NUMBER`, `BOOLEAN`, `DATE`, `PASSWORD` (maskované s kopírováním), `URL` (klikací), `NOTE` (víceřádkový Markdown), `FILE` (reference na VFS soubor), `JSON` (strukturovaný blok). Každé pole má `id`, `name`, `type`, `required`, `defaultValue` a `sortOrder`.
+   - **Editace schématu a migrace záznamů:** Možnost přidat, přejmenovat, změnit pořadí (drag & drop / tlačítka posunu) nebo odebrat pole v existující databázi s automatickou migrací existujících záznamů (`Record`) a navýšením `rev`.
+   - Dynamicky generovaný formulář pro vytváření a editaci záznamů na základě schématu databáze, filtrování, fulltextové vyhledávání v záznamech a řazení podle libovolného pole.
+5. **Kalendář (Encrypted Calendar + System Sync):**
+   - **Měsíční pohled** (mřížka dnů s barevnými tečkovými indikátory událostí) a **Agendový pohled** (chronologická časová osa událostí).
+   - Události s názvem, popisem, začátkem, koncem, přepínačem „Celý den" (`all_day`), barvou, opakováním (`NONE`, `DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`), připomínkami (5 min, 15 min, 30 min, 1 hod, 1 den předem – spouštěné přes `WorkManager` / `AlarmManager` s lokální notifikací, která neprozrazuje citlivé detaily při zamčeném trezoru).
+   - Obousměrné propojení událostí s poznámkami (`linked_notes`) a databázovými záznamy (`linked_records`).
+   - **Volitelná obousměrná synchronizace se systémovým Android kalendářem (`CalendarContract`):** Při povolení oprávnění `READ_CALENDAR` a `WRITE_CALENDAR` umožňuje exportovat vybrané nebo všechny události (s možností anonymizace názvu na „OpenVault událost") do systémového kalendáře a importovat události ze systémového kalendáře do šifrovaného trezoru.
+6. **Kolekce a složky (Collections):**
+   - Stromová hierarchie (`parent_id`), vlastní ikona a barva, změna pořadí (`sort_order`), přesouvání položek mezi kolekcemi, rychlé filtrování podle kolekce.
+7. **Audit Log (Append-Only Encrypted Log):**
+   - Každá bezpečnostně nebo datově významná událost (odemknutí trezoru, neúspěšný pokus o odemknutí, zamknutí, vytvoření/úprava/smazání objektu, kopírování hesla, export/import zálohy, změna master hesla, synchronizace, změna bezpečnostního nastavení) zapíše šifrovaný záznam do lokální tabulky `audit_entries` a synchronizuje jej do Supabase tabulky `vault_audit`.
+   - Záznamy jsou **append-only** (nelze je v UI editovat ani jednotlivě mazat).
+   - **Zásada nulového úniku:** Audit log nikdy neobsahuje plaintext hesla, klíče ani tajný obsah (pouze typ akce, časové razítko, identifikátor objektu, obecný popis a metadata zařízení).
+   - Možnost filtrování podle typu události, časového období a exportu audit logu (v šifrované nebo po autorizaci čitelné JSON/CSV podobě).
+8. **Export a Import (`.ovault` šifrovaný kontejner):**
+   - Kompletní export celého trezoru (všechny objekty, nastavení, audit log a šifrované soubory) do **jednoho souboru s příponou `.ovault`**.
+   - Soubor `.ovault` má binární/JSON hlavičku s magickými bajty `OVAULT01`, verzí formátu, parametry KDF, solí, integritním HMAC/SHA-256 otiskem a samotným AES-256-GCM šifrovaným datovým blokem.
+   - Import `.ovault` souboru na čisté instalaci i do existujícího trezoru (režim Merge nebo Replace) s ověřením integrity před rozbalením.
+9. **Synchronizace (Online-First Sync Engine):**
+   - Automatická synchronizace při startu/odemknutí a při každé změně (pokud je zařízení online), manuální spuštění, pull-to-refresh na seznamech, delta sync podle `updated_at` a `rev`, offline fronta (`SyncQueue`) s exponenciálním backoffem přes `WorkManager`, Realtime odběr změn a stálý indikátor stavu v horní liště (`TopAppBar`).
+10. **Bezpečnostní centrum (Security Center):**
+    - Kompletní přehled zabezpečení: výpočet celkového Security Score (0–100 %), kontrola kryptografické integrity všech objektů v trezoru (porovnání SHA-256 integritního hashe a ověření GCM tagů všech záznamů), přehled slabých/duplicitních/expirovaných hesel, stav synchronizace, informace o aktuálním zařízení a integritě systému (root check, StrongBox status), bezpečná změna Master Password (přešifrování obálky `Vault Key` novým `Master Key` + aktualizace v Supabase) a nouzové bezpečné smazání trezoru (Cryptographic Wipe).
+
+---
+
+## 6. RYCHLÉ AKCE A INTUITIVITA
+
+Aplikace musí být navržena pro maximální rychlost (cíl: **maximálně 3 klepnutí ke každé funkci, pohodlné ovládání jednou rukou**):
+
+1. **Multifunkční FAB (Floating Action Button) vpravo dole na hlavních obrazovkách:**
+   - **Klepnutí na FAB:** Rozbalí animované kruhové / vějířové menu s 5 rychlými akcemi: *Poznámka*, *Událost*, *Heslo*, *Soubor*, *Záznam*.
+   - **Dlouhý stisk FAB (Long-press):** Okamžitě otevře editor nové poznámky s automaticky fokusovaným textovým polem a vysunutou klávesnicí.
+   - **Tažení FAB nahoru (Swipe-up gesture na FAB):** Otevře **Quick Capture Sheet** (rychlý sběrný bottom sheet pro bleskový zápis poznámky, hesla nebo úkolu bez opuštění aktuální obrazovky).
+2. **Gesto Swipe-down z horní části obrazovky:**
+   - Rychlé stažení na Dashboardu rovněž vyvolá **Quick Capture Sheet**.
+3. **Trvalá notifikace (Persistent Quick-Action Notification):**
+   - Pokud je trezor odemčený (a funkce je v nastavení povolena), zobrazuje se tichá notifikace s přímými akčními tlačítky: **+ Poznámka**, **+ Událost**, **+ Heslo** a **Zamknout hned** (okamžitě zavolá `SecurityGate.lock()`). Při zamknutí trezoru se notifikace automaticky skryje.
+4. **Widgety na plochu (App Widgets):**
+   - Implementuj 4 plně registrované `AppWidgetProvider` widgety (včetně `res/xml/*_info.xml` a zápisu v `AndroidManifest.xml`):
+     - **1×1 Quick Note:** Okamžité otevření nové poznámky.
+     - **2×2 Quick Actions:** Čtyři dlaždice (Poznámka, Heslo, Událost, Zamknout).
+     - **4×2 Today Agenda:** Přehled počtu dnešních událostí a rychlé otevření kalendáře (bez úniku citlivého plaintextu, pokud je trezor zamčený).
+     - **4×2 Recent Notes:** Rychlý přístup k posledním poznámkám (po klepnutí vyžádá odemknutí, pokud je zamčeno).
+5. **App Shortcuts (Dlouhý stisk ikony aplikace v launcheru):**
+   - Statické i dynamické zkratky (`res/xml/shortcuts.xml`): *Nová poznámka*, *Nová událost*, *Nové heslo*, *Otevřít audit log*.
+6. **Gesta na kartách a v seznamech:**
+   - **Swipe doleva na kartě:** Rychlé akce (Smazat / Archivovat, u hesel Zkopírovat heslo).
+   - **Swipe doprava na kartě:** Přepnutí příznaku *Oblíbené / Připnuté*.
+   - **Long-press na kartě:** Kontextové bottom-sheet menu (Upravit, Duplikovat, Přesunout do kolekce, Propojit s událostí, Exportovat, Smazat).
+   - **Pull-to-refresh:** Okamžitá delta synchronizace se Supabase.
+   - **Dvojklik (Double-tap) na titulek v detailu:** Okamžitý přechod do režimu inline editace.
+7. **Klávesové zkratky (podpora hardwarové / Bluetooth klávesnice a DeX/tabletů):**
+   - Zachytávej v `MainActivity` / kořenovém `Modifier.onPreviewKeyEvent`:
+     - `Ctrl + N` = Nová poznámka
+     - `Ctrl + E` = Nová událost
+     - `Ctrl + K` nebo `Ctrl + F` = Globální vyhledávání / Quick Capture
+     - `Ctrl + S` = Okamžité uložení a synchronizace
+     - `Ctrl + L` = Okamžité zamknutí trezoru (`SecurityGate.lock()`)
+     - `Esc` = Zavření modalu / návrat zpět
+
+---
+
+## 7. OBRAZOVKY (kompletní seznam)
+
+Aplikace musí obsahovat všech **38 obrazovek, dialogů a bottom sheetů**. Každá obrazovka musí mít kompletně implementované stavy **Loading**, **Empty** (s jasnou výzvou k akci), **Error** (bez úniku citlivých interních dat) a **Success**:
+
+1. **Onboarding – Welcome:** Představení E2E architektury OpenVault, volba „Vytvořit nový trezor" nebo „Obnovit existující trezor (Import `.ovault` / Připojit přes `Vault ID` + Master heslo)".
+2. **Onboarding – Vytvoření master hesla:** Zadání a potvrzení Master Password, živý výpočet entropie a indikátor síly hesla, kontrola minimálních požadavků, upozornění že heslo nelze obnovit, vygenerování `vault_id`, soli a `Vault Key`.
+3. **Onboarding – Zapnutí biometrie:** Nabídka aktivace otisku prstu / biometrie přes `BiometricPrompt` + uložení `wrapped_vk_biometric` a prvotní registrace trezoru do tabulky `vaults` v Supabase.
+4. **Odemknutí – Biometrie:** Výchozí odemykací obrazovka (pokud je biometrie aktivní a zařízení nebylo od posledního odemknutí restartováno) s automatickým vyvoláním `BiometricPrompt` a tlačítkem pro přepnutí na heslo.
+5. **Odemknutí – Zadání hesla:** Zadání Master Password, dešifrování `Vault Key` přes Argon2id/PBKDF2, počítadlo neúspěšných pokusů s progresivním zpožděním (rate-limiting proti brute-force) a zápisem do audit logu.
+6. **Dashboard / Přehled:** Hlavní rozcestník po odemknutí – Rychlé akce, karta Stav trezoru a synchronizace, sekce *Dnes v kalendáři*, *Připnuté a nedávné poznámky*, *Naposledy použitá hesla* a rychlé statistiky objektů.
+7. **Navigation Drawer:** Boční vysouvací panel obsahující hlavičku se stavem trezoru (`Vault ID` zkrácený otisk, stav šifrování, tlačítko rychlého zamknutí) a položky: *Přehled*, *Poznámky*, *Kalendář*, *Hesla*, *Soubory*, *Databáze*, *Kolekce*, *Bezpečnostní centrum*, *Audit log*, *Nastavení*.
+8. **Poznámky – Seznam:** Fulltextové vyhledávání (v dešifrované paměti/SQLCipher), filtry podle štítků a kolekcí, řazení (datum úpravy, datum vytvoření, abecedně), swipe akce na kartách, multifunkční FAB.
+9. **Poznámka – Editor:** Automatické ukládání (autosave s 3s debounce), Markdown formátovací lišta (H1, H2, Bold, Italic, Checklist, Code, Quote, Link), rychlé přidávání štítků, výběr kolekce, připojení souborů a událostí, nepovinný titulek (pokud není zadán, odvodí se z prvního řádku nebo času).
+10. **Poznámka – Detail:** Čtecí režim s vykresleným Markdownem, interaktivními checkboxy, seznamem příloh, propojenými událostmi, tlačítkem historie revizí a dvojklikem na titulek pro okamžitou editaci.
+11. **Kalendář – Měsíční pohled:** Přehledná měsíční mřížka, barevné tečky událostí pod dny, výběr dne se zobrazením událostí vybraného dne pod kalendářem, dlouhý stisk na den = vytvoření nové události v daný den.
+12. **Kalendář – Agenda:** Chronologická časová osa nadcházejících i proběhlých událostí s přímými prokliky na propojené poznámky a databázové záznamy.
+13. **Událost – Editor:** Zadání názvu, popisu, data a času (s rychlými čipy trvání: 15 m, 30 m, 1 h, 2 h, Celý den), nastavení připomínek, pravidla opakování, výběr propojených poznámek a záznamů.
+14. **Událost – Detail:** Kompletní zobrazení události, odpočet do začátku, seznam propojených objektů, akce exportu do systémového kalendáře, úprava a smazání.
+15. **Hesla – Seznam:** Kategorie hesel (čipy), vyhledávání, karta hesla se jménem, doménou, indikátorem síly a rychlou ikonou kopírování hesla (📋) i TOTP kódu, swipe gesto pro bleskové zkopírování.
+16. **Heslo – Detail & Editor:** Zobrazení/skrytí hesla, kopírování s 30s odpočtem vymazání schránky, živý **TOTP autentikátor** s 30s kruhovým odpočtem a kopírováním kódu, vestavěný generátor hesel a passphrase, indikátor síly a historie změn hesla.
+17. **Soubory – Prohlížeč (VFS):** Drobečková navigace (breadcrumbs) složek, přepínání zobrazení (seznam / mřížka), nahrání souboru, vytvoření podsložky, třídění, vyhledávání, long-press kontextové menu.
+18. **Soubor – Detail:** Dešifrovaný náhled v paměti (pro obrázky, text, Markdown, JSON), kryptografická metadata (velikost, MIME typ, SHA-256 hash, stav uložení v Supabase Storage, číslo revize), seznam propojených poznámek/záznamů, bezpečný export/sdílení nebo smazání.
+19. **Databáze – Seznam:** Přehled všech uživatelských databází s počtem záznamů, ikonou, popisem a tlačítkem pro vytvoření nové databáze nebo použití předpřipravené šablony databáze.
+20. **Databáze – Schema Builder:** Vytváření a úprava schématu databáze – přidávání polí, volba datového typu (`TEXT`, `NUMBER`, `BOOLEAN`, `DATE`, `PASSWORD`, `URL`, `NOTE`, `FILE`, `JSON`), přepínač povinného pole, změna pořadí polí (drag & drop / šipky nahoru a dolů), uložení s automatickou migrací záznamů.
+21. **Databáze – Záznamy (Seznam):** Výpis všech záznamů vybrané databáze, fulltextové vyhledávání napříč hodnotami polí, řazení podle zvoleného sloupce, rychlé akce.
+22. **Záznam – Editor:** Dynamicky vykreslený formulář přesně podle `schema_json` dané databáze (včetně validace typů, generátoru hesel u polí typu `PASSWORD`, date pickeru u `DATE` a výběru souboru u `FILE`).
+23. **Záznam – Detail:** Přehledné zobrazení všech polí záznamu s možností rychlého kopírování jednotlivých hodnot, otevírání URL, zobrazení připojených souborů a metadat revize.
+24. **Audit Log:** Chronologický výpis dešifrovaných záznamů z `vault_audit`, vyhledávání, filtrování podle kategorie akce (Autentizace, Data, Synchronizace, Bezpečnost), detail události a export.
+25. **Bezpečnostní centrum:** Celkové skóre zabezpečení, tlačítko „Spustit kontrolu integrity trezoru" (s progress barem), přehled slabých/opakovaných hesel, stav synchronizace a přihlášeného `Vault ID`, stav zařízení (StrongBox, Root detekce), změna Master Password a bezpečné smazání.
+26. **Nastavení – Hlavní rozcestník:** Přehledné kategorie nastavení s ikonami a podtitulky.
+27. **Nastavení – Bezpečnost:** Přepínač biometrie, timeout automatického zamknutí (1, 2, 5, 10, 15, 30 min), zamknutí při minimalizaci, `FLAG_SECURE` (skrytí v přepínači aplikací), vymazání schránky po 30 s, změna Master Password, nastavení nouzového (Duress) hesla.
+28. **Nastavení – Synchronizace:** Stav připojení k Supabase, zobrazení `Vault ID` (s možností zkopírování pro spárování druhého zařízení), frekvence synchronizace na pozadí (15 m, 30 m, 1 h, Manuálně), přepínač „Synchronizovat pouze přes Wi-Fi", přepínač Realtime odběru, strategie řešení konfliktů, tlačítko „Vynutit plnou synchronizaci".
+29. **Nastavení – Vzhled:** Režim motivu (**AMOLED Černý #000000** jako výchozí, Tmavý šedý, Světlý, Podle systému), volba akcentové barvy (Emerald, Cyan, Violet, Amber, Crimson), velikost písma (Malé, Výchozí, Velké) a hustota prvků (Kompaktní, Komfortní).
+30. **Nastavení – Data a zálohy:** Export celého trezoru do šifrovaného souboru `.ovault`, import ze souboru `.ovault`, vymazání lokální dešifrované/dočasné cache, sekce Nebezpečná zóna (odpojení zařízení, trvalé smazání lokálního i cloudového trezoru).
+31. **Nastavení – Kalendář:** Povolení a konfigurace obousměrné synchronizace se systémovým Android kalendářem (`CalendarContract`), výběr cílového systémového kalendáře, volba anonymizace názvů při exportu, výchozí čas připomínky.
+32. **Nastavení – Rychlé akce:** Konfigurace chování FAB (výchozí akce při dlouhém stisku), výběr položek v kruhovém menu FAB, zapnutí/vypnutí trvalé notifikace pro rychlý zápis, přehled a návod k widgetům.
+33. **Nastavení – Audit a logy:** Nastavení úrovně detailů audit logu, statistika počtu záznamů, ověření řetězce záznamů a export auditního protokolu.
+34. **Nastavení – O aplikaci:** Verze aplikace, kryptografická specifikace (AES-256-GCM, Argon2id/PBKDF2, SQLCipher, Supabase E2E), přehled použitých open-source technologií, diagnostika připojení k Supabase.
+35. **Quick Capture Sheet:** Rychlý modální bottom sheet vyvolaný tažením FAB nahoru nebo swipe-down gestem – přepínač typu (Rychlá poznámka / Rychlé heslo / Rychlá událost) a okamžité uložení jedním klepnutím.
+36. **Sync Progress Modal:** Modální dialog / bottom sheet zobrazující detailní průběh synchronizace nebo kontroly integrity (aktuální krok, progress bar `0–100 %`, počet odeslaných/stažených objektů, stavový text).
+37. **Lock Confirmation Bottom Sheet:** Potvrzovací bottom sheet při ručním zamknutí nebo odhlášení s informací o vyčištění klíčů z RAM a stavu neodeslané fronty.
+38. **Kontextová menu (Long-press Bottom Sheets):** Univerzální kontextový bottom sheet pro karty poznámek, hesel, souborů, událostí a záznamů.
+
+---
+
+## 8. DATOVÝ MODEL (Room + Supabase mapping)
+
+Lokální databáze **Room** běží nad **SQLCipher** (`SupportFactory(sqlCipherKey)`). Navrhni čisté mapování mezi lokálními Room entitami, doménovými modely a šifrovanými Supabase DTO objekty (`vault_objects`, `vault_files`, `vault_audit`, `vault_sync_log`).
+
+### Lokální Room entity a doménové struktury:
+1. **`NoteEntity` (`object_type = 'note'`):**
+   - `id: String (UUID)`, `vaultId: String`, `collectionId: String?` (`parent_id`), `title: String`, `body: String`, `tagsJson: String` (`List<String>`), `attachmentsJson: String` (`List<String>` – ID souborů), `eventLinksJson: String` (`List<String>` – ID událostí), `historyJson: String` (`List<NoteRevision>`), `isPinned: Boolean`, `isFavorite: Boolean`, `color: String?`, `templateName: String?`, `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+2. **`PasswordEntity` (`object_type = 'password'`):**
+   - `id: String (UUID)`, `vaultId: String`, `collectionId: String?`, `title: String`, `username: String`, `encryptedPassword: String` (nebo v šifrované SQLCipher DB + chráněné přes `SecurityGate`), `url: String`, `totpSecret: String?`, `notes: String`, `category: String`, `strengthScore: Int`, `isFavorite: Boolean`, `expiresAt: Long?`, `lastChangedAt: Long`, `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+3. **`CalendarEventEntity` (`object_type = 'event'`):**
+   - `id: String (UUID)`, `vaultId: String`, `title: String`, `description: String`, `startAt: Long`, `endAt: Long`, `allDay: Boolean`, `remindersJson: String` (`List<Int>` – minuty předem), `recurrenceRule: String` (`NONE`, `DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`), `linkedNotesJson: String` (`List<String>`), `linkedRecordsJson: String` (`List<String>`), `systemCalendarEventId: Long?`, `color: String?`, `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+4. **`VaultFileEntity` (mapováno na `vault_files` + Storage bucket `vault-files`):**
+   - `id: String (UUID)`, `vaultId: String`, `folderId: String?`, `storagePath: String` (`{vault_id}/{file_id}.enc`), `encryptedMetadata: ByteArray` (obsahuje JSON s `fileName`, `mimeType`, `sha256Hex`, `folderId`, `thumbnailBase64`, `linkedObjectIds`), `metadataNonce: ByteArray`, `decryptedFileName: String`, `mimeType: String`, `sizeBytes: Long`, `localEncryptedPath: String?`, `sha256Hex: String`, `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+5. **`UserDatabaseEntity` (`object_type = 'database'`):**
+   - `id: String (UUID)`, `vaultId: String`, `name: String`, `description: String`, `icon: String`, `schemaJson: String` (`List<DatabaseFieldSchema>`), `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+6. **`DatabaseRecordEntity` (`object_type = 'record'`, `parent_id = database_id`):**
+   - `id: String (UUID)`, `vaultId: String`, `databaseId: String`, `valuesJson: String` (`Map<String, JsonElement>`), `isFavorite: Boolean`, `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+7. **`CollectionEntity` (`object_type = 'collection'`):**
+   - `id: String (UUID)`, `vaultId: String`, `parentId: String?`, `name: String`, `icon: String`, `color: String?`, `sortOrder: Int`, `createdAt: Long`, `updatedAt: Long`, `deletedAt: Long?`, `rev: Long`.
+8. **`AuditEntryEntity` (mapováno na `vault_audit`):**
+   - `id: Long`, `remoteId: Long?`, `vaultId: String`, `actionType: String`, `targetObjectId: String?`, `summary: String`, `deviceInfo: String`, `encryptedPayload: ByteArray`, `nonce: ByteArray`, `createdAt: Long`, `isSynced: Boolean`.
+9. **`SyncQueueEntity` (lokální offline fronta):**
+   - `id: Long (autoGenerate)`, `tableName: String` (`vaults`, `vault_objects`, `vault_files`, `vault_audit`), `objectId: String`, `action: String` (`upsert`, `delete`), `payloadJson: String`, `rev: Long`, `retries: Int`, `lastError: String?`, `createdAt: Long`.
+
+### Mapování do Supabase (`vault_objects`):
+Při odesílání jakéhokoli objektu (`Note`, `Password`, `CalendarEvent`, `UserDatabase`, `DatabaseRecord`, `Collection`) do Supabase:
+1. Doménový objekt se serializuje do JSONu (`kotlinx.serialization`).
+2. JSON bajty se zašifrují přes `SecurityGate.encrypt(plainBytes)` → vznikne `encryptedPayload: ByteArray` a `nonce: ByteArray` (12 bajtů).
+3. Do tabulky `vault_objects` se odešle pouze: `id`, `vault_id`, `object_type`, `parent_id`, `encrypted_payload` (`\x...`), `nonce` (`\x...`), `rev`, `deleted_at`, `created_at`, `updated_at`.
+4. Současně se zapíše záznam o změně do `vault_sync_log` (`vault_id`, `object_id`, `table_name`, `action`, `rev`).
+
+---
+
+## 9. SYNC LOGIKA
+
+Implementuj robustní třídu **`SyncEngine`** a **`SyncWorker` (`CoroutineWorker`)**:
+
+1. **Online-First Zápis (Write-Through):**
+   - Každá změna vytvořená uživatelem se **nejdříve atomicky uloží do lokální Room+SQLCipher databáze** s inkrementovaným `rev = currentRev + 1` a aktuálním `updatedAt`.
+   - Zápis se rovněž zaznamená do `SyncQueueEntity`.
+   - Pokud je zařízení online, `SyncEngine` okamžitě na pozadí odešle položku do Supabase (`upsert` do `vault_objects` / `vault_files` / `vault_audit`) a po úspěšném potvrzení ji odstraní ze `SyncQueueEntity`.
+   - Pokud je zařízení offline nebo volání selže, položka zůstává v `SyncQueueEntity` a `WorkManager` s podmínkou `NetworkType.CONNECTED` a exponenciálním backoffem (`BackoffPolicy.EXPONENTIAL`) zajistí odeslání hned po obnovení spojení.
+2. **Delta Pull při startu a odemknutí:**
+   - Aplikace si pamatuje `last_sync_timestamp`.
+   - Při odemknutí trezoru (a při pull-to-refresh) stáhne ze Supabase všechny záznamy z `vault_objects` a `vault_files`, kde `updated_at > last_sync_timestamp` (nebo kompletní seznam při prvním spuštění na novém zařízení).
+   - Každý přijatý záznam se dešifruje přes `SecurityGate.decrypt(encrypted_payload, nonce)`.
+3. **Řešení konfliktů (Conflict Resolution – Last-Write-Wins s detekcí kolize):**
+   - Při porovnání lokálního záznamu a vzdáleného záznamu:
+     - Pokud má vzdálený záznam vyšší `rev` (nebo stejné `rev` a novější `updated_at`) a lokální záznam nemá neodeslanou změnu ve `SyncQueue`, lokální záznam se tiše aktualizuje.
+     - Pokud byl záznam mezitím změněn i lokálně (je v `SyncQueue`) i vzdáleně, vyhrává záznam s vyšším `rev` (při shodě `rev` novější `updated_at`), přičemž přepsaná verze se uloží do historie revizí objektu (u poznámek) nebo do záznamu v `AuditEntry` a uživateli se zobrazí nevtíravé upozornění na vyřešený konflikt.
+   - Pokud má vzdálený záznam vyplněné `deleted_at != null`, provede se soft-delete i lokálně.
+4. **Realtime odběr:**
+   - Pokud je trezor odemčený a Realtime povolen, `SyncEngine` odebírá změny přes `supabase.realtime` kanál na tabulkách `vault_objects` a `vault_files` a okamžitě promítá změny z jiných zařízení do lokální Room databáze.
+5. **Indikátor stavu synchronizace v `TopAppBar`:**
+   - V horní liště zobrazuj živý stav ze `SyncEngine.syncState: StateFlow<SyncStatus>`:
+     - `☁✓` (`Synced` – vše synchronizováno, zelený/emerald indikátor)
+     - `☁↻` (`Syncing` – právě probíhá přenos, animovaná ikona)
+     - `☁⚠` (`ConflictOrWarning` – nevyřízená kolize nebo chyba přenosu, oranžový/červený indikátor s možností klepnutí pro detail)
+     - `☁✕` (`Offline` – bez připojení, změny čekají ve frontě `SyncQueue`)
+
+---
+
+## 10. TESTOVACÍ SCÉNÁŘE (AI je musí implementovat a ověřit)
+
+Součástí projektu musí být reálné unit a integrační testy (v `app/src/test/...`), které ověřují následující scénáře, a samotná implementace aplikace musí všemi těmito scénáři bezchybně projít:
+
+1. **Onboarding & Inicializace:** Vytvoření Master Password, validace entropie/síly hesla, odvození `Master Key` (Argon2id/PBKDF2), vygenerování `Vault Key`, vytvoření záznamu v `vaults` a nahrání do Supabase s hlavičkou `x-vault-id`.
+2. **Odemknutí (Unlock Flow):** Úspěšné odemknutí biometrií (`CryptoObject`), selhání biometrie → plynulý fallback na Master Password, odmítnutí nesprávného hesla (selhání GCM autentizačního tagu při rozbalování `Vault Key`) a vynucení hesla po simulovaném restartu zařízení.
+3. **Kompletní CRUD všech entit:** Vytvoření, úprava, přečtení a soft-delete poznámky, hesla (včetně generování platného 6místného RFC 6238 TOTP kódu), kalendářní události, šifrovaného souboru ve VFS, uživatelské databáze se vlastním schématem a záznamu v této databázi.
+4. **Kalendář a systémová integrace:** Vytvoření události, propojení s poznámkou a záznamem, převod do struktur `CalendarContract.Events` pro export do systémového kalendáře.
+5. **Synchronizace (Online & Offline Queue):** Vytvoření objektu v online režimu → okamžitý push do Supabase; vytvoření objektu v offline režimu → uložení do `SyncQueue` → přechod do online režimu → kompletní vyprázdnění fronty (`flushSyncQueue`) a ověření LWW řešení konfliktů podle `rev` a `updated_at`.
+6. **Auto-lock a správa paměti:** Po uplynutí nastavených N minut nečinnosti dojde k automatickému uzamčení `SecurityGate`, vynulování (`zeroize`) bajtů klíče v RAM a znepřístupnění dešifrovacích operací.
+7. **Lock / Unlock cyklus:** Po zamknutí a opětovném odemknutí Master heslem zůstávají všechna lokální data neporušená a znovu dešifrovatelná.
+8. **Restart aplikace:** Po ukončení procesu a novém spuštění data v SQLCipher přežijí, aplikace vyžaduje autentizaci před zobrazením Dashboardu.
+9. **Export a Import `.ovault`:** Kompletní export celého trezoru do šifrovaného `.ovault` kontejneru, ověření hlavičky a HMAC/GCM integrity, vymazání trezoru a 100% obnova všech dat importem souboru `.ovault`.
+10. **Audit Log:** Zaznamenání bezpečnostních a datových akcí, dešifrování záznamů po odemknutí a striktní ověření, že v žádném poli audit logu neexistuje plaintext heslo ani tajný klíč.
+11. **Chybové stavy:** Detekce poškozeného šifrovaného blobu (změna bajtu v ciphertextu → `AEADBadTagException`), ošetření výpadku sítě bez pádu aplikace, ošetření nedostatku místa při práci se soubory.
+12. **Kontrola integrity (Integrity Check):** Výpočet celkového integritního hashe trezoru, detekce neoprávněné manipulace se záznamy a bezpečný rollback/obnova.
+
+---
+
+## 11. UI/UX SPECIFIKACE
+
+- **AMOLED Dark Mode jako výchozí:** Pozadí obrazovek (`background`, `surface`) v AMOLED režimu je čistá černá `#000000`, karty a vyvýšené povrchy používají jemně odlišené tmavé odstíny (`#0D0D11`, `#14141B`) s tenkým kontrastním rámečkem (`1.dp` `outlineVariant`) pro dokonalou čitelnost na OLED displejích a úsporu baterie.
+- **Material 3 + vlastní `OpenVaultTheme`:** Podpora přepínání mezi AMOLED Černým, Tmavým, Světlým a Systémovým motivem + volba akcentové barvy a škálování typografie.
+- **Navigace bez spodní lišty:** **ŽÁDNÝ Bottom Navigation Bar.** Veškerá hlavní navigace probíhá přes `ModalNavigationDrawer` + `TopAppBar` s indikátorem stavu synchronizace, vyhledáváním a tlačítkem okamžitého uzamčení trezoru.
+- **Bottom Sheets:** Všechny modální dialogy, kontextové nabídky, filtry a rychlé vstupy (`Quick Capture Sheet`, `Lock Confirmation`, `Kontextová menu`) vyjíždějí zespodu (`ModalBottomSheet`) pro snadné ovládání palcem jedné ruky.
+- **Haptická odezva:** Používej `LocalHapticFeedback` (`HapticFeedbackType.LongPress`, `TextHandleMove`) při dlouhém stisku FAB, kopírování hesla, odemknutí/zamknutí trezoru a dokončení swipe gesta.
+- **Progress indikátory:** Každá kryptografická nebo síťová operace (odvození klíče Argon2id, export `.ovault`, synchronizace, kontrola integrity) zobrazuje přehledný stavový indikátor s popisem právě prováděného kroku.
+- **Stavy obrazovek:** Každý seznam a detail má dedikovaný, vizuálně propracovaný `EmptyStateView` (s ikonou, vysvětlením a tlačítkem akce), `LoadingStateView` a bezpečný `ErrorStateView`.
+
+---
+
+## 12. POVINNÉ VÝSTUPNÍ POŽADAVKY
+
+Výstupem tvé práce musí být **kompletní, produkčně připravený Android projekt**:
+
+1. **Konfigurační soubory projektu:**
+   - `settings.gradle.kts`, kořenový `build.gradle.kts`, `gradle/libs.versions.toml`, `app/build.gradle.kts`, `gradle.properties`, `proguard-rules.pro`.
+   - Kompletní `app/src/main/AndroidManifest.xml` (oprávnění `INTERNET`, `ACCESS_NETWORK_STATE`, `USE_BIOMETRIC`, `READ_CALENDAR`, `WRITE_CALENDAR`, `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`, registrace `OpenVaultApplication`, `MainActivity`, widgetů a app shortcuts).
+   - XML resources: `res/xml/shortcuts.xml`, `res/xml/widget_quick_note_info.xml`, `res/xml/widget_quick_actions_info.xml`, `res/xml/widget_today_info.xml`, `res/xml/widget_recent_notes_info.xml`, layouty widgetů a `res/values/strings.xml`, `themes.xml`.
+2. **Čistá vícevrstvá architektura balíčků (`com.openvault.app`):**
+   - `data/local/` – Room databáze (`OpenVaultDatabase` se SQLCipher `SupportFactory`), všechny `@Entity` třídy, kompletní `@Dao` rozhraní s `Flow` dotazy a Room migrace (`MIGRATION_1_2` atd.).
+   - `data/remote/` – `SupabaseClientFactory` (s reálným `SUPABASE_URL`, `SUPABASE_ANON_KEY` a automatickým `x-vault-id` header interceptorem), PostgREST DTO modely, `ByteaHexSerializer`, `SupabaseRemoteDataSource` (PostgREST + Storage `vault-files` + Realtime).
+   - `data/repository/` – Implementace repozitářů spojující lokální Room cache, `SecurityGate` šifrování a `SyncEngine`.
+   - `domain/model/` – Čisté doménové modely (`Note`, `PasswordItem`, `CalendarEvent`, `VaultFile`, `UserDatabase`, `DatabaseRecord`, `Collection`, `AuditEntry`, `VaultSettings`, `SecurityReport`).
+   - `domain/usecase/` – Use-casy pro klíčové operace (Onboarding, Unlock, CRUD, Export/Import `.ovault`, CalendarContract sync, Integrity check, TOTP generator, Password generator & strength analyzer).
+   - `security/` – `SecurityGate`, `CryptoEngine` (AES-256-GCM), `KeyDerivationService` (Argon2id + PBKDF2-HMAC-SHA256), `BiometricKeyManager` (Android Keystore + `BiometricPrompt.CryptoObject`), `ClipboardSecurityHelper`, `DeviceIntegrityChecker`, `OvaultBackupManager`.
+   - `sync/` – `SyncEngine`, `SyncWorker` (`WorkManager`), `RealtimeSyncSubscriber`, `ConflictResolver`.
+   - `ui/theme/` – `OpenVaultTheme`, AMOLED barvy, typografie.
+   - `ui/navigation/` – Kompletní navigační graf, `ModalNavigationDrawer`, správa stavu uzamčení.
+   - `ui/components/` – Multifunkční `ExpandableFab`, `QuickCaptureSheet`, `SyncStatusBadge`, `LockConfirmationSheet`, `SyncProgressModal`, `ContextMenuSheet`, Markdown editor & renderer.
+   - `ui/screens/` – Všech **38 obrazovek** plně naimplementovaných v Jetpack Compose.
+   - `widget/` & `notification/` – Implementace všech 4 widgetů a `QuickCaptureNotificationManager`.
+   - `di/` – Kompletní Hilt moduly (`AppModule`, `DatabaseModule`, `SecurityModule`, `SupabaseModule`, `SyncModule`).
+3. **Unit testy (`app/src/test/java/com/openvault/app/...`):**
+   - Testy pro `CryptoEngine`, `KeyDerivationService`, `SecurityGate` (zeroization, lock/unlock, AAD/GCM tag verification, změna hesla), `TotpGenerator` (RFC 6238 testovací vektory), `OvaultBackupManager` (export/import roundtrip + detekce poškození) a `SyncEngine` / `ConflictResolver` (LWW podle `rev` a `updated_at`, offline queue flush).
+4. **Absolutní zákaz nedodělků:**
+   - **ŽÁDNÉ `TODO`**, **ŽÁDNÉ placeholdery**, **ŽÁDNÉ `// implement later`**, **ŽÁDNÉ `TODO("Not yet implemented")`**, **ŽÁDNÉ demo/mock režimy**.
+   - Každé tlačítko, každé gesto, každý formulář, každá obrazovka a každá kryptografická i synchronizační funkce musí být 100% naimplementovaná a propojená s reálnou logikou.
+
+---
+
+## 13. POKYNY PRO AI STUDIO
+
+1. **Fáze 1 – Architektonický plán (Plan Mode):**
+   - Nejprve vypiš přehledný a strukturovaný plán implementace: stromovou strukturu všech souborů projektu, návrh toků klíčů v `SecurityGate`, binární specifikaci `.ovault` souboru a pořadí kroků.
+2. **Fáze 2 – Kompletní implementace kódu:**
+   - Postupuj systematicky vrstvu po vrstvě (`gradle` & `manifest` → `security` → `data/local` & `data/remote` → `sync` → `domain` → `di` → `ui/theme` & `ui/components` → `ui/screens` → `widget` & `notification` → `test`).
+   - Piš kompletní obsah každého souboru od prvního `package` řádku až po poslední složenou závorku. Nikdy nezkracuj kód komentáři typu `// ... rest of the code ...` nebo `// similar for other fields`.
+   - Pokud narazíš na jakoukoli hranu mezi knihovnami (např. inicializace SQLCipher s Room, serializace `BYTEA` pro Supabase PostgREST nebo `BiometricPrompt.CryptoObject`), vyřeš ji čistým, produkčním kódem.
+3. **Fáze 3 – Závěrečná verifikace:**
+   - Na konci zkontroluj, že je přítomno všech 38 obrazovek, reálné konstanty `SUPABASE_URL` a `SUPABASE_ANON_KEY`, hlavička `x-vault-id` u každého požadavku a že všech 12 testovacích scénářů z bodu 10 prochází.

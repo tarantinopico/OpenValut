@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">OpenVault</string>
+    <string name="shortcut_new_note_short">Nová poznámka</string>
+    <string name="shortcut_new_note_long">Vytvořit šifrovanou poznámku</string>
+    <string name="shortcut_new_event_short">Nová událost</string>
+    <string name="shortcut_new_event_long">Přidat událost do kalendáře</string>
+    <string name="shortcut_new_password_short">Nové heslo</string>
+    <string name="shortcut_new_password_long">Uložit nové heslo s TOTP</string>
+    <string name="shortcut_audit_log_short">Audit log</string>
+    <string name="shortcut_audit_log_long">Otevřít šifrovaný audit log</string>
+    <string name="widget_quick_note_desc">Okamžité vytvoření nové šifrované poznámky (1×1)</string>
+    <string name="widget_quick_actions_desc">Rychlé akce OpenVault: Poznámka, Heslo, Událost, Zamknout (2×2)</string>
+    <string name="widget_today_desc">Dnešní šifrovaná agenda v kalendáři OpenVault (4×2)</string>
+    <string name="widget_recent_notes_desc">Rychlý přístup k posledním poznámkám v trezoru (4×2)</string>
+</resources>

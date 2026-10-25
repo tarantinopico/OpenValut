@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="new_note"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_new_note_short"
+        android:shortcutLongLabel="@string/shortcut_new_note_long">
+        <intent
+            android:action="com.openvault.app.ACTION_QUICK_NOTE"
+            android:targetPackage="com.aistudio.openvault.vltsec"
+            android:targetClass="com.example.MainActivity" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="new_event"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_new_event_short"
+        android:shortcutLongLabel="@string/shortcut_new_event_long">
+        <intent
+            android:action="com.openvault.app.ACTION_QUICK_EVENT"
+            android:targetPackage="com.aistudio.openvault.vltsec"
+            android:targetClass="com.example.MainActivity" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="new_password"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_new_password_short"
+        android:shortcutLongLabel="@string/shortcut_new_password_long">
+        <intent
+            android:action="com.openvault.app.ACTION_QUICK_PASSWORD"
+            android:targetPackage="com.aistudio.openvault.vltsec"
+            android:targetClass="com.example.MainActivity" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="open_audit"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_audit_log_short"
+        android:shortcutLongLabel="@string/shortcut_audit_log_long">
+        <intent
+            android:action="com.openvault.app.ACTION_OPEN_AUDIT"
+            android:targetPackage="com.aistudio.openvault.vltsec"
+            android:targetClass="com.example.MainActivity" />
+    </shortcut>
+</shortcuts>

@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for fixing the OpenVault black screen issue (FLAG_SECURE default in streaming environments and SQLCipher locked/unlocked database lifecycle) and adding an automated GitHub Actions CI/CD workflow that builds the Debug APK and publishes a GitHub Release.",
+  "updatedAt":  "2026-10-25T20:23:45.072724320Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

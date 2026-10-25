@@ -1,0 +1,6 @@
+{
+  "name": "OpenVault",
+  "description": "Osobní 100% end-to-end šifrovaný digitální trezor pro Android (poznámky, hesla s TOTP, šifrované soubory VFS, kalendář, uživatelské databáze a audit log) se synchronizací přes Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
